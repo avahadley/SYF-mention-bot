@@ -1,4 +1,4 @@
-# bot.py — aiogram 3.7+ group mention bot with /rollcall
+# bot.py — aiogram 3.7+ group mention bot with /rollcall and webhook fix
 import os
 import asyncio
 import logging
@@ -35,7 +35,7 @@ DEFAULTS = {
     "tag_style": "empty",      # empty | emoji | name
     "emoji": "📣",
     "chunk_size": 8,           # members per message
-    "delay_ms": 900,           # delay between chunks
+    "delay_ms": 900,           # delay between chunks (ms)
 }
 
 DB: aiosqlite.Connection | None = None
@@ -155,13 +155,11 @@ def build_mention_text(row, style: str, emoji: str):
     uid = row["user_id"]
     visible_handle = f'@{row["username"]}' if row["username"] else ""
     full_name = " ".join([x for x in [row["first_name"], row["last_name"]] if x]).strip() or "member"
-    # Invisible link pings the user even without visible text
-    invisible_link = f'<a href="tg://user?id={uid}">\u2063</a>'
+    invisible_link = f'<a href="tg://user?id={uid}">\u2063</a>'  # invisible ping
     if style == "emoji":
         return f"{emoji} {visible_handle or full_name}{invisible_link}"
     if style == "name":
         return f"{full_name}{invisible_link}"
-    # "empty": prefer handle if we have it; otherwise just the invisible ping
     return f"{visible_handle}{invisible_link}" if visible_handle else invisible_link
 
 def chunkify(seq, n):
@@ -206,14 +204,13 @@ async def member_updates(ev: ChatMemberUpdated):
 async def start_cmd(msg: Message):
     await msg.answer("✅ Bot is online.\nAdd me to a group, make me admin, then try /rollcall and /all.")
 
-# =============== /rollcall (button to “mark present”) ===============
+# =============== /rollcall (button to mark present) ===============
 @dp.message(Command("rollcall"))
 async def rollcall(msg: Message):
     if msg.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         await msg.answer("Use /rollcall inside a group.")
         return
 
-    # button contains the chat_id so the callback knows where to record
     data = f"roll:{msg.chat.id}"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="I’m here ✅", callback_data=data)]]
@@ -294,11 +291,14 @@ async def tag_all(msg: Message):
 
     rows = await list_members(chat_id)
     if not rows:
-        # suggest rollcall with a button to send it
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="Start rollcall", callback_data=f"roll:{chat_id}")]]
         )
-        await msg.reply("I don’t know anyone here yet. Use /rollcall so people can tap the button, or ask everyone to send one short message.", reply_markup=kb)
+        await msg.reply(
+            "I don’t know anyone here yet. Use /rollcall so people can tap the button, "
+            "or ask everyone to send one short message.",
+            reply_markup=kb,
+        )
         return
 
     flag = flag_for(chat_id)
@@ -320,7 +320,6 @@ async def tag_all(msg: Message):
         text = " ".join(chunk)
 
         if replied:
-            # copy the replied message, then reply to the copy with the mentions
             try:
                 sent = await replied.copy_to(chat_id)
                 await bot.send_message(
@@ -336,9 +335,12 @@ async def tag_all(msg: Message):
     if not flag.is_set():
         await msg.answer("✅ Done.")
 
-# =============== Runner ===============
+# =============== Runner (includes webhook cleanup) ===============
 async def main():
     await init_db()
+    # Ensure no old webhook/instance conflicts with polling
+    await bot.delete_webhook(drop_pending_updates=True)
+
     logging.info("Starting polling…")
     await dp.start_polling(bot)
 
