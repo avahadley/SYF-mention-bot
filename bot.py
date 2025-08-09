@@ -6,20 +6,20 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, ChatMemberUpdated
 from aiogram.enums import ChatType
-from aiogram.client.default import DefaultBotProperties  # <-- NEW
+from aiogram.client.default import DefaultBotProperties
 
-# ---- config & logging ----
+# ================= Config & logging =================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
-    raise SystemExit("Missing TELEGRAM_TOKEN")
+    raise SystemExit("Missing TELEGRAM_TOKEN environment variable")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# aiogram 3.7+: set parse_mode via DefaultBotProperties
-bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))  # <-- CHANGED
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))  # aiogram 3.7+ syntax
 dp = Dispatcher()
 
 DB_PATH = "data.db"
+
 DEFAULTS = {
     "only_admins": True,
     "copy_message": False,
@@ -28,7 +28,10 @@ DEFAULTS = {
     "chunk_size": 8,
     "delay_ms": 900,
 }
-stop_flags: dict[int, asyncio.Event] = {}
+
+# Global DB connection + lock to avoid aiosqlite thread errors
+DB: aiosqlite.Connection | None = None
+DB_LOCK = asyncio.Lock()
 
 CREATE_SQL = """
 PRAGMA journal_mode=WAL;
@@ -51,32 +54,30 @@ CREATE TABLE IF NOT EXISTS members (
 );
 """
 
-async def db():
-    conn = await aiosqlite.connect(DB_PATH)
-    conn.row_factory = aiosqlite.Row
-    return conn
-
+# ================= DB helpers =================
 async def init_db():
-    async with await db() as conn:
-        for stmt in CREATE_SQL.strip().split(";"):
-            s = stmt.strip()
-            if s:
-                await conn.execute(s)
-        await conn.commit()
+    """Create one global connection and initialize tables."""
+    global DB
+    if DB is None:
+        DB = await aiosqlite.connect(DB_PATH)
+        DB.row_factory = aiosqlite.Row
+        await DB.executescript(CREATE_SQL)
+        await DB.commit()
+    logging.info("DB ready")
 
 async def get_config(chat_id: int):
-    async with await db() as conn:
-        cur = await conn.execute("SELECT * FROM chat_config WHERE chat_id=?", (chat_id,))
+    async with DB_LOCK:
+        cur = await DB.execute("SELECT * FROM chat_config WHERE chat_id=?", (chat_id,))
         row = await cur.fetchone()
         if not row:
-            await conn.execute(
+            await DB.execute(
                 """INSERT INTO chat_config
                    (chat_id, only_admins, copy_message, tag_style, emoji, chunk_size, delay_ms)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (chat_id, int(DEFAULTS["only_admins"]), int(DEFAULTS["copy_message"]),
                  DEFAULTS["tag_style"], DEFAULTS["emoji"], DEFAULTS["chunk_size"], DEFAULTS["delay_ms"])
             )
-            await conn.commit()
+            await DB.commit()
             return DEFAULTS.copy()
         return {
             "only_admins": bool(row["only_admins"]),
@@ -90,34 +91,38 @@ async def get_config(chat_id: int):
 async def set_config(chat_id: int, **kwargs):
     cfg = await get_config(chat_id)
     cfg.update(kwargs)
-    async with await db() as conn:
-        await conn.execute(
+    async with DB_LOCK:
+        await DB.execute(
             """REPLACE INTO chat_config(chat_id, only_admins, copy_message, tag_style, emoji, chunk_size, delay_ms)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (chat_id, int(cfg["only_admins"]), int(cfg["copy_message"]), cfg["tag_style"],
              cfg["emoji"], cfg["chunk_size"], cfg["delay_ms"])
         )
-        await conn.commit()
+        await DB.commit()
     return cfg
 
 async def upsert_member(chat_id: int, user):
-    async with await db() as conn:
-        await conn.execute(
+    async with DB_LOCK:
+        await DB.execute(
             """REPLACE INTO members(chat_id, user_id, first_name, last_name, username)
                VALUES (?, ?, ?, ?, ?)""",
             (chat_id, user.id, user.first_name or "", user.last_name or "", user.username or "")
         )
-        await conn.commit()
+        await DB.commit()
 
 async def delete_member(chat_id: int, user_id: int):
-    async with await db() as conn:
-        await conn.execute("DELETE FROM members WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        await conn.commit()
+    async with DB_LOCK:
+        await DB.execute("DELETE FROM members WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        await DB.commit()
 
 async def list_members(chat_id: int):
-    async with await db() as conn:
-        cur = await conn.execute("SELECT * FROM members WHERE chat_id=?", (chat_id,))
-        return await cur.fetchall()
+    async with DB_LOCK:
+        cur = await DB.execute("SELECT * FROM members WHERE chat_id=?", (chat_id,))
+        rows = await cur.fetchall()
+        return rows
+
+# ================= Utils =================
+stop_flags: dict[int, asyncio.Event] = {}
 
 async def is_admin(chat_id: int, user_id: int) -> bool:
     try:
@@ -129,7 +134,7 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
 def build_mention_text(row, style: str, emoji: str):
     uid = row["user_id"]
     full_name = " ".join([n for n in [row["first_name"], row["last_name"]] if n]).strip() or "member"
-    mention = f'<a href="tg://user?id={uid}">\u2063</a>'
+    mention = f'<a href="tg://user?id={uid}">\u2063</a>'  # invisible mention keeps ping
     visible_handle = f'@{row["username"]}' if row["username"] else ""
     if style == "empty":
         return mention if not visible_handle else f'{visible_handle}{mention}'
@@ -154,6 +159,7 @@ def get_stop_flag(chat_id: int) -> asyncio.Event:
         stop_flags[chat_id] = flag
     return flag
 
+# ================= Learn members =================
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def learn_active_users(msg: Message):
     if not msg.from_user or msg.from_user.is_bot:
@@ -170,6 +176,7 @@ async def member_updates(ev: ChatMemberUpdated):
     if new.status in {"left", "kicked"}:
         await delete_member(chat_id, user.id)
 
+# ================= Commands =================
 @dp.message(Command("start"))
 async def start_dm(msg: Message):
     await msg.answer("✅ Bot is online.\nAdd me to a group, make me admin, then try /all.")
@@ -227,7 +234,7 @@ async def tag_all(msg: Message):
 
     rows = await list_members(chat_id)
     if not rows:
-        await msg.reply("I don’t know anyone here yet. Let me observe messages a bit to learn members.")
+        await msg.reply("I don’t know anyone here yet. Send a few messages so I can learn members.")
         return
 
     flag = get_stop_flag(chat_id)
@@ -259,6 +266,7 @@ async def tag_all(msg: Message):
     if not flag.is_set():
         await msg.answer("✅ Done.")
 
+# ================= Runner =================
 async def main():
     await init_db()
     logging.info("Starting polling…")
