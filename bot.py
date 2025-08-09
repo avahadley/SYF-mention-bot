@@ -1,40 +1,269 @@
+import os
 import asyncio
 import logging
-import os
-from aiogram import Bot, Dispatcher
-from aiogram.filters import CommandStart
-from aiogram.types import Message
+import aiosqlite
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message, ChatMemberUpdated
+from aiogram.enums import ChatType
 
-# ========= Config =========
-# Read the token from environment (Render: Environment Variables)
+# ---- config & logging ----
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-# Fail fast if token is missing
 if not TOKEN:
-    raise SystemExit("Missing TELEGRAM_TOKEN environment variable")
+    raise SystemExit("Missing TELEGRAM_TOKEN")
 
-# Logging helps us debug in Render logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Aiogram v3 setup
-bot = Bot(token=TOKEN, parse_mode="HTML")
+bot = Bot(TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# ===== Handlers =====
-@dp.message(CommandStart())
-async def on_start(m: Message):
-    await m.answer("✅ Bot is online. Add me to a group and make me admin.\nTry /ping here or in a DM.")
+DB_PATH = "data.db"
+DEFAULTS = {
+    "only_admins": True,
+    "copy_message": False,
+    "tag_style": "empty",  # empty | emoji | name
+    "emoji": "🔔",
+    "chunk_size": 8,
+    "delay_ms": 900,
+}
+stop_flags: dict[int, asyncio.Event] = {}
 
-@dp.message()
-async def echo(m: Message):
-    # Simple sanity check that the bot is responding
-    if m.text and m.text.strip().lower() == "/ping":
-        await m.answer("pong")
-    elif m.text:
-        await m.answer(f"You said: {m.text}")
+CREATE_SQL = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS chat_config (
+  chat_id INTEGER PRIMARY KEY,
+  only_admins INTEGER NOT NULL DEFAULT 1,
+  copy_message INTEGER NOT NULL DEFAULT 0,
+  tag_style TEXT NOT NULL DEFAULT 'empty',
+  emoji TEXT NOT NULL DEFAULT '🔔',
+  chunk_size INTEGER NOT NULL DEFAULT 8,
+  delay_ms INTEGER NOT NULL DEFAULT 900
+);
+CREATE TABLE IF NOT EXISTS members (
+  chat_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  first_name TEXT,
+  last_name TEXT,
+  username TEXT,
+  PRIMARY KEY (chat_id, user_id)
+);
+"""
 
-# ===== Runner =====
+# -------------- DB helpers --------------
+async def db():
+    conn = await aiosqlite.connect(DB_PATH)
+    conn.row_factory = aiosqlite.Row
+    return conn
+
+async def init_db():
+    async with await db() as conn:
+        for stmt in CREATE_SQL.strip().split(";"):
+            s = stmt.strip()
+            if s:
+                await conn.execute(s)
+        await conn.commit()
+
+async def get_config(chat_id: int):
+    async with await db() as conn:
+        cur = await conn.execute("SELECT * FROM chat_config WHERE chat_id=?", (chat_id,))
+        row = await cur.fetchone()
+        if not row:
+            await conn.execute(
+                """INSERT INTO chat_config
+                   (chat_id, only_admins, copy_message, tag_style, emoji, chunk_size, delay_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (chat_id, int(DEFAULTS["only_admins"]), int(DEFAULTS["copy_message"]),
+                 DEFAULTS["tag_style"], DEFAULTS["emoji"], DEFAULTS["chunk_size"], DEFAULTS["delay_ms"])
+            )
+            await conn.commit()
+            return DEFAULTS.copy()
+        return {
+            "only_admins": bool(row["only_admins"]),
+            "copy_message": bool(row["copy_message"]),
+            "tag_style": row["tag_style"],
+            "emoji": row["emoji"],
+            "chunk_size": row["chunk_size"],
+            "delay_ms": row["delay_ms"],
+        }
+
+async def set_config(chat_id: int, **kwargs):
+    cfg = await get_config(chat_id)
+    cfg.update(kwargs)
+    async with await db() as conn:
+        await conn.execute(
+            """REPLACE INTO chat_config(chat_id, only_admins, copy_message, tag_style, emoji, chunk_size, delay_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (chat_id, int(cfg["only_admins"]), int(cfg["copy_message"]), cfg["tag_style"],
+             cfg["emoji"], cfg["chunk_size"], cfg["delay_ms"])
+        )
+        await conn.commit()
+    return cfg
+
+async def upsert_member(chat_id: int, user):
+    async with await db() as conn:
+        await conn.execute(
+            """REPLACE INTO members(chat_id, user_id, first_name, last_name, username)
+               VALUES (?, ?, ?, ?, ?)""",
+            (chat_id, user.id, user.first_name or "", user.last_name or "", user.username or "")
+        )
+        await conn.commit()
+
+async def delete_member(chat_id: int, user_id: int):
+    async with await db() as conn:
+        await conn.execute("DELETE FROM members WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        await conn.commit()
+
+async def list_members(chat_id: int):
+    async with await db() as conn:
+        cur = await conn.execute("SELECT * FROM members WHERE chat_id=?", (chat_id,))
+        return await cur.fetchall()
+
+# -------------- utils --------------
+async def is_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        return any(a.user.id == user_id for a in admins)
+    except Exception:
+        return False
+
+def build_mention_text(row, style: str, emoji: str):
+    uid = row["user_id"]
+    full_name = " ".join([n for n in [row["first_name"], row["last_name"]] if n]).strip() or "member"
+    mention = f'<a href="tg://user?id={uid}">\u2063</a>'  # invisible mention
+    visible_handle = f'@{row["username"]}' if row["username"] else ""
+    if style == "empty":
+        return mention if not visible_handle else f'{visible_handle}{mention}'
+    if style == "emoji":
+        return f'{emoji} {visible_handle or full_name}{mention}'
+    return f'{full_name}{mention}'
+
+def chunkify(seq, n):
+    buf = []
+    for x in seq:
+        buf.append(x)
+        if len(buf) >= n:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+def get_stop_flag(chat_id: int) -> asyncio.Event:
+    flag = stop_flags.get(chat_id)
+    if not flag:
+        flag = asyncio.Event()
+        stop_flags[chat_id] = flag
+    return flag
+
+# -------------- learn members --------------
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def learn_active_users(msg: Message):
+    if not msg.from_user or msg.from_user.is_bot:
+        return
+    await upsert_member(msg.chat.id, msg.from_user)
+
+@dp.chat_member()
+async def member_updates(ev: ChatMemberUpdated):
+    chat_id = ev.chat.id
+    new = ev.new_chat_member
+    user = new.user
+    if new.status in {"member", "administrator", "creator"}:
+        await upsert_member(chat_id, user)
+    if new.status in {"left", "kicked"}:
+        await delete_member(chat_id, user.id)
+
+# -------------- commands --------------
+@dp.message(Command("start"))
+async def start_dm(msg: Message):
+    await msg.answer("✅ Bot is online.\nAdd me to a group, make me admin, then try /all.")
+
+@dp.message(Command("onlyadmins"))
+async def onlyadmins(msg: Message):
+    await set_config(msg.chat.id, only_admins=True)
+    await msg.reply("✅ `/all` is now admins only.", parse_mode="Markdown")
+
+@dp.message(Command("noonlyadmins"))
+async def noonlyadmins(msg: Message):
+    await set_config(msg.chat.id, only_admins=False)
+    await msg.reply("✅ `/all` allowed for everyone.", parse_mode="Markdown")
+
+@dp.message(Command("copymessage"))
+async def copymessage(msg: Message):
+    await set_config(msg.chat.id, copy_message=True)
+    await msg.reply("✅ Tagging will copy the replied message (if present).")
+
+@dp.message(Command("nocopymessage"))
+async def nocopymessage(msg: Message):
+    await set_config(msg.chat.id, copy_message=False)
+    await msg.reply("✅ Tagging will send fresh messages.")
+
+@dp.message(Command("emptytagtype"))
+async def emptytagtype(msg: Message):
+    await set_config(msg.chat.id, tag_style="empty")
+    await msg.reply("✅ Tag style set to plain mentions.")
+
+@dp.message(Command("emojitagtype"))
+async def emojitagtype(msg: Message):
+    cfg = await get_config(msg.chat.id)
+    await set_config(msg.chat.id, tag_style="emoji", emoji=cfg["emoji"])
+    await msg.reply(f"✅ Tag style set to emoji ({cfg['emoji']}).")
+
+@dp.message(Command("nametagtype"))
+async def nametagtype(msg: Message):
+    await set_config(msg.chat.id, tag_style="name")
+    await msg.reply("✅ Tag style set to Name + mention.")
+
+@dp.message(Command("stopall"))
+async def stopall(msg: Message):
+    get_stop_flag(msg.chat.id).set()
+    await msg.reply("🛑 Stopping current tag run (if any).")
+
+@dp.message(Command("all"))
+async def tag_all(msg: Message):
+    chat_id = msg.chat.id
+    user_id = msg.from_user.id if msg.from_user else 0
+    cfg = await get_config(chat_id)
+
+    if cfg["only_admins"] and not await is_admin(chat_id, user_id):
+        await msg.reply("⛔ Only admins can use `/all` here.", parse_mode="Markdown")
+        return
+
+    rows = await list_members(chat_id)
+    if not rows:
+        await msg.reply("I don’t know anyone here yet. Let me observe messages a bit to learn members.")
+        return
+
+    flag = get_stop_flag(chat_id)
+    flag.clear()
+
+    mentions = [build_mention_text(r, cfg["tag_style"], cfg["emoji"]) for r in rows]
+    chunks = list(chunkify(mentions, max(1, int(cfg["chunk_size"]))))
+
+    header = "📣 Tagging everyone…" if cfg["tag_style"] != "emoji" else f"{cfg['emoji']} Tagging everyone…"
+    await msg.reply(f"{header} ({len(rows)} members known)")
+
+    replied = msg.reply_to_message if cfg["copy_message"] and msg.reply_to_message else None
+
+    for chunk in chunks:
+        if flag.is_set():
+            await msg.answer("✅ Stopped.")
+            break
+        text = " ".join(chunk)
+        if replied:
+            try:
+                sent = await replied.copy_to(chat_id, reply_to_message_id=None)
+                await bot.send_message(chat_id, text, reply_to_message_id=sent.message_id, disable_web_page_preview=True)
+            except Exception:
+                await bot.send_message(chat_id, text, disable_web_page_preview=True)
+        else:
+            await bot.send_message(chat_id, text, disable_web_page_preview=True)
+        await asyncio.sleep(cfg["delay_ms"] / 1000)
+
+    if not flag.is_set():
+        await msg.answer("✅ Done.")
+
+# -------------- runner --------------
 async def main():
+    await init_db()
     logging.info("Starting polling…")
     await dp.start_polling(bot)
 
