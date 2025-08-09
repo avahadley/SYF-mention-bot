@@ -1,13 +1,11 @@
-# bot.py — aiogram 3.x webhook bot for Telegram groups
-# Features: /rollcall + /all mentioner, admin-only toggle, copy-message option,
-# name/emoji/empty tag styles, sqlite persistence.
+# bot.py — aiogram 3.7+ mention bot for Telegram groups
+# Supports both POLLING (background worker) and WEBHOOK (web service)
 
 import os
 import asyncio
 import logging
-import aiosqlite
 
-from aiohttp import web
+import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType
@@ -15,46 +13,38 @@ from aiogram.filters import Command
 from aiogram.types import (
     Message,
     ChatMemberUpdated,
-    CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    CallbackQuery,
 )
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# -------------------- ENV & logging --------------------
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")   # e.g. https://syf-mention-bot-imrt.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")       # any random string you set in Render
-PORT = int(os.getenv("PORT", "10000"))             # Render provides PORT automatically
-
-if not TOKEN:
-    raise SystemExit("Missing TELEGRAM_TOKEN env var")
-if not BASE_URL:
-    raise SystemExit("Missing BASE_URL env var")
-if not WEBHOOK_SECRET:
-    raise SystemExit("Missing WEBHOOK_SECRET env var")
-
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
-
+# -------- Logging --------
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
 )
+
+# -------- Config --------
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise SystemExit("Missing TELEGRAM_TOKEN environment variable")
+
+MODE = (os.getenv("MODE") or "").strip().lower()
+BASE_URL = (os.getenv("BASE_URL") or "").strip()  # e.g., https://syf-mention-bot-xxxx.onrender.com
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
+PORT = int(os.getenv("PORT") or 10000)
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
-# -------------------- Defaults & DB --------------------
+# -------- Defaults & DB schema --------
 DB_PATH = "data.db"
-
 DEFAULTS = {
-    "only_admins": True,
-    "copy_message": False,
-    "tag_style": "empty",   # empty | emoji | name
+    "only_admins": True,        # /all allowed only for admins
+    "copy_message": False,      # copy replied message when tagging
+    "tag_style": "empty",       # empty | emoji | name
     "emoji": "📣",
-    "chunk_size": 8,
-    "delay_ms": 900,
+    "chunk_size": 8,            # members per message
+    "delay_ms": 900,            # delay between chunks
 }
 
 DB: aiosqlite.Connection | None = None
@@ -81,6 +71,7 @@ CREATE TABLE IF NOT EXISTS members (
 );
 """
 
+# -------- DB helpers --------
 async def init_db():
     global DB
     if DB is None:
@@ -160,7 +151,7 @@ async def list_members(chat_id: int):
         cur = await DB.execute("SELECT * FROM members WHERE chat_id=?", (chat_id,))
         return await cur.fetchall()
 
-# -------------------- Helpers --------------------
+# -------- Utils --------
 stop_flags: dict[int, asyncio.Event] = {}
 
 async def is_admin(chat_id: int, user_id: int) -> bool:
@@ -174,12 +165,13 @@ def build_mention_text(row, style: str, emoji: str):
     uid = row["user_id"]
     visible_handle = f'@{row["username"]}' if row["username"] else ""
     full_name = " ".join([x for x in [row["first_name"], row["last_name"]] if x]).strip() or "member"
-    # Invisible link pings the user (ZERO WIDTH JOINER char as text).
+    # Invisible link pings the user even without visible text
     invisible_link = f'<a href="tg://user?id={uid}">\u2063</a>'
     if style == "emoji":
         return f"{emoji} {visible_handle or full_name}{invisible_link}"
     if style == "name":
         return f"{full_name}{invisible_link}"
+    # "empty": prefer handle if we have it; otherwise just the invisible ping
     return f"{visible_handle}{invisible_link}" if visible_handle else invisible_link
 
 def chunkify(seq, n):
@@ -199,7 +191,7 @@ def flag_for(chat_id: int) -> asyncio.Event:
         stop_flags[chat_id] = flag
     return flag
 
-# -------------------- Learning & basic commands --------------------
+# -------- Basic /ping & member learning --------
 @dp.message(Command("ping"))
 async def ping(msg: Message):
     await msg.reply("pong ✅")
@@ -219,11 +211,15 @@ async def member_updates(ev: ChatMemberUpdated):
     if new.status in {"left", "kicked"}:
         await delete_member(chat_id, user.id)
 
+# -------- /start --------
 @dp.message(Command("start"))
 async def start_cmd(msg: Message):
-    await msg.answer("✅ Bot is online.\nAdd me to a group, make me admin, then try /rollcall and /all.")
+    await msg.answer(
+        "✅ Bot is online.\n"
+        "Add me to a group, make me admin, then try /rollcall and /all."
+    )
 
-# -------------------- /rollcall --------------------
+# -------- /rollcall (button people tap to be learned) --------
 @dp.message(Command("rollcall"))
 async def rollcall(msg: Message):
     if msg.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
@@ -253,7 +249,7 @@ async def roll_press(cb: CallbackQuery):
 
     await cb.answer("Marked you present!")
 
-# -------------------- Settings --------------------
+# -------- Settings commands --------
 @dp.message(Command("onlyadmins"))
 async def onlyadmins(msg: Message):
     await set_config(msg.chat.id, only_admins=True)
@@ -295,8 +291,8 @@ async def stopall(msg: Message):
     flag_for(msg.chat.id).set()
     await msg.reply("🛑 Stopping current tag run (if any).")
 
-# -------------------- /all --------------------
-@dp.message(Command("all")))
+# -------- /all (tag everybody we know) --------
+@dp.message(Command("all"))
 async def tag_all(msg: Message):
     chat_id = msg.chat.id
     user_id = msg.from_user.id if msg.from_user else 0
@@ -352,36 +348,61 @@ async def tag_all(msg: Message):
     if not flag.is_set():
         await msg.answer("✅ Done.")
 
-# -------------------- Webhook server --------------------
-async def on_startup(app: web.Application):
-    await init_db()
-    # Set the webhook (drop pending to avoid duplicates)
-    await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
-    logging.info(f"Webhook set to {WEBHOOK_URL}")
+# -------- Runner: polling or webhook --------
+async def run_polling():
+    logging.info("Starting polling…")
+    await dp.start_polling(bot)
 
-async def on_shutdown(app: web.Application):
-    # Remove webhook and close bot session/DB cleanly
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-    if DB is not None:
-        await DB.close()
-    await bot.session.close()
+async def run_webhook():
+    # Require BASE_URL and WEBHOOK_SECRET
+    if not BASE_URL or not WEBHOOK_SECRET:
+        raise SystemExit("Webhook mode needs BASE_URL and WEBHOOK_SECRET env vars")
 
-def build_app() -> web.Application:
+    from aiohttp import web
+    from aiogram.webhook.aiohttp_server import (
+        SimpleRequestHandler,
+        setup_application,
+    )
+
+    # Set webhook on Telegram
+    webhook_path = f"/webhook/{WEBHOOK_SECRET}"
+    await bot.set_webhook(
+        url=f"{BASE_URL}{webhook_path}",
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+    )
+
+    # Aiohttp app with health route
     app = web.Application()
-    # health check
-    async def health(_):
-        return web.Response(text="ok")
-    app.router.add_get("/", health)
-
-    # register webhook path
-    SimpleRequestHandler(dp, bot, secret_token=WEBHOOK_SECRET).register(app, path=WEBHOOK_PATH)
+    app.router.add_get("/", lambda _: web.Response(text="OK"))
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(
+        app, path=webhook_path
+    )
     setup_application(app, dp, bot=bot)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    return app
+
+    logging.info(f"Webhook listening on {webhook_path} (PORT={PORT})")
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+
+    # Keep running forever
+    while True:
+        await asyncio.sleep(3600)
+
+async def main():
+    await init_db()
+    use_webhook = False
+    if MODE:
+        use_webhook = MODE == "webhook"
+    else:
+        # If BASE_URL present, prefer webhook automatically
+        use_webhook = bool(BASE_URL)
+
+    if use_webhook:
+        await run_webhook()
+    else:
+        await run_polling()
 
 if __name__ == "__main__":
-    web.run_app(build_app(), host="0.0.0.0", port=PORT)
+    asyncio.run(main())
