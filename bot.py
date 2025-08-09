@@ -1,6 +1,12 @@
 import asyncio
 import logging
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env (only needed for local dev)
+load_dotenv()
+
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 import aiosqlite
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -8,7 +14,6 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
 
 # Enable logging
 logging.basicConfig(level=logging.INFO)
