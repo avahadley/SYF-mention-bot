@@ -9,6 +9,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, ChatMemberUpdated
 from aiogram.enums import ChatType
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # -------------------- config & logging --------------------
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -230,7 +231,8 @@ async def cmd_all(msg: Message):
 
     rows = await list_members(chat_id)
     if not rows:
-        await msg.reply("I don’t know anyone here yet. Send a few messages so I can learn members.")
+        await msg.reply("I don’t know anyone here yet. Use /rollcall so people can tap the button, "
+                    "or ask everyone to send one short message.")
         return
 
     flag = stop_flag(chat_id)
@@ -239,6 +241,36 @@ async def cmd_all(msg: Message):
     mentions = [build_mention_text(r, cfg["tag_style"], cfg["emoji"]) for r in rows]
     chunks = list(chunkify(mentions, max(1, int(cfg["chunk_size"]))))
 
+    # ================= Rollcall =================
+# /rollcall -> posts a button; tapping the button adds the user to the DB (silent toast)
+@dp.message(Command("rollcall"))
+async def rollcall(msg: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="I’m here ✅", callback_data="rollcall")]
+    ])
+    await msg.reply(
+        "Tap the button so I can learn who’s here. Once most people tap it, use /all.",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data == "rollcall")
+async def rollcall_cb(cb: CallbackQuery):
+    # Learn this user without cluttering the chat
+    await upsert_member(cb.message.chat.id, cb.from_user)
+    await cb.answer("Got you ✅", show_alert=False)
+
+    # Optional: update the message to show current count
+    rows = await list_members(cb.message.chat.id)
+    try:
+        await cb.message.edit_text(
+            f"Thanks! I know {len(rows)} members so far. "
+            f"Others: tap the button so I can tag you with /all.",
+            reply_markup=cb.message.reply_markup
+        )
+    except Exception:
+        # Ignore if we can’t edit (e.g., already edited)
+        pass
+        
     header = "📣 Tagging everyone…" if cfg["tag_style"] != "emoji" else f"{cfg['emoji']} Tagging everyone…"
     await msg.reply(f"{header} ({len(rows)} members known)")
 
