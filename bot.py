@@ -18,6 +18,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))  # aiogram 3.7+ syntax
 dp = Dispatcher()
 
+dp = Dispatcher()
+
+# --- DEBUG: log & quick test in groups ---
+@dp.message(Command("ping"))
+async def ping(msg: Message):
+    await msg.reply("pong ✅")
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def _debug_logger(msg: Message):
+    who = (msg.from_user.username or (msg.from_user.full_name if msg.from_user else "unknown"))
+    logging.info(f"DBG group {msg.chat.id} from {who}: {msg.text!r}")
+    if msg.text and msg.text.startswith("/debug"):
+        await msg.reply(f"Seen debug in group {msg.chat.id}.")
+
 DB_PATH = "data.db"
 
 DEFAULTS = {
