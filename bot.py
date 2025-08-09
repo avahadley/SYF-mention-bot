@@ -18,8 +18,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))  # aiogram 3.7+ syntax
 dp = Dispatcher()
 
-dp = Dispatcher()
-
 # --- DEBUG: log & quick test in groups ---
 @dp.message(Command("ping"))
 async def ping(msg: Message):
