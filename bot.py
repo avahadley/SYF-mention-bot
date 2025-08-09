@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, ChatMemberUpdated
 from aiogram.enums import ChatType
+from aiogram.client.default import DefaultBotProperties  # <-- NEW
 
 # ---- config & logging ----
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -14,7 +15,8 @@ if not TOKEN:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-bot = Bot(TOKEN, parse_mode="HTML")
+# aiogram 3.7+: set parse_mode via DefaultBotProperties
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))  # <-- CHANGED
 dp = Dispatcher()
 
 DB_PATH = "data.db"
@@ -49,7 +51,6 @@ CREATE TABLE IF NOT EXISTS members (
 );
 """
 
-# -------------- DB helpers --------------
 async def db():
     conn = await aiosqlite.connect(DB_PATH)
     conn.row_factory = aiosqlite.Row
@@ -118,7 +119,6 @@ async def list_members(chat_id: int):
         cur = await conn.execute("SELECT * FROM members WHERE chat_id=?", (chat_id,))
         return await cur.fetchall()
 
-# -------------- utils --------------
 async def is_admin(chat_id: int, user_id: int) -> bool:
     try:
         admins = await bot.get_chat_administrators(chat_id)
@@ -129,7 +129,7 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
 def build_mention_text(row, style: str, emoji: str):
     uid = row["user_id"]
     full_name = " ".join([n for n in [row["first_name"], row["last_name"]] if n]).strip() or "member"
-    mention = f'<a href="tg://user?id={uid}">\u2063</a>'  # invisible mention
+    mention = f'<a href="tg://user?id={uid}">\u2063</a>'
     visible_handle = f'@{row["username"]}' if row["username"] else ""
     if style == "empty":
         return mention if not visible_handle else f'{visible_handle}{mention}'
@@ -154,7 +154,6 @@ def get_stop_flag(chat_id: int) -> asyncio.Event:
         stop_flags[chat_id] = flag
     return flag
 
-# -------------- learn members --------------
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def learn_active_users(msg: Message):
     if not msg.from_user or msg.from_user.is_bot:
@@ -171,7 +170,6 @@ async def member_updates(ev: ChatMemberUpdated):
     if new.status in {"left", "kicked"}:
         await delete_member(chat_id, user.id)
 
-# -------------- commands --------------
 @dp.message(Command("start"))
 async def start_dm(msg: Message):
     await msg.answer("✅ Bot is online.\nAdd me to a group, make me admin, then try /all.")
@@ -261,7 +259,6 @@ async def tag_all(msg: Message):
     if not flag.is_set():
         await msg.answer("✅ Done.")
 
-# -------------- runner --------------
 async def main():
     await init_db()
     logging.info("Starting polling…")
