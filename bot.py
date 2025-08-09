@@ -1,61 +1,41 @@
 import asyncio
 import logging
 import os
-from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher
+from aiogram.filters import CommandStart
+from aiogram.types import Message
 
-# Load environment variables from .env (only needed for local dev)
-load_dotenv()
-
+# ========= Config =========
+# Read the token from environment (Render: Environment Variables)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-import aiosqlite
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Fail fast if token is missing
+if not TOKEN:
+    raise SystemExit("Missing TELEGRAM_TOKEN environment variable")
 
-# Enable logging
-logging.basicConfig(level=logging.INFO)
+# Logging helps us debug in Render logs
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Initialize bot and dispatcher
-bot = Bot(token=TOKEN)
+# Aiogram v3 setup
+bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-DB_PATH = "mentions.db"
-
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS mentions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            message TEXT
-        )
-        """)
-        await db.commit()
-
-@dp.message(Command("start"))
-async def start_command(message: types.Message):
-    await message.answer("Hello! I will save mentions for you.")
+# ===== Handlers =====
+@dp.message(CommandStart())
+async def on_start(m: Message):
+    await m.answer("✅ Bot is online. Add me to a group and make me admin.\nTry /ping here or in a DM.")
 
 @dp.message()
-async def save_mentions(message: types.Message):
-    if message.entities:
-        for entity in message.entities:
-            if entity.type == "mention":
-                mention_text = message.text[entity.offset:entity.offset + entity.length]
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "INSERT INTO mentions (user_id, username, message) VALUES (?, ?, ?)",
-                        (message.from_user.id, message.from_user.username, mention_text)
-                    )
-                    await db.commit()
-                await message.answer(f"Saved mention: {mention_text}")
+async def echo(m: Message):
+    # Simple sanity check that the bot is responding
+    if m.text and m.text.strip().lower() == "/ping":
+        await m.answer("pong")
+    elif m.text:
+        await m.answer(f"You said: {m.text}")
 
+# ===== Runner =====
 async def main():
-    await init_db()
+    logging.info("Starting polling…")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
